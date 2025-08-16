@@ -1,6 +1,18 @@
 # chatbot_app.py
 from __future__ import annotations
 
+# --- Patch sqlite for Chroma (Streamlit Cloud often has old sqlite3) ---
+# Requires: pysqlite3-binary in requirements.txt
+try:
+    import sqlite3
+    ver = tuple(map(int, sqlite3.sqlite_version.split(".")))
+    if ver < (3, 35, 0):
+        import pysqlite3  # type: ignore
+        import sys
+        sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    pass  # If patch fails, Chroma may still try its own fallback
+
 import os
 import io
 import contextlib
@@ -8,10 +20,10 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load local .env if present (no-op on Cloud)
+# Load local .env if present (safe no-op on Cloud)
 load_dotenv(override=False)
 
-# ---- Import query_data.py (relative import first, then fallback loader) ----
+# --- Import query_data (relative, with safe fallback loader) ---
 try:
     import query_data as qd
 except Exception:
@@ -21,7 +33,7 @@ except Exception:
     qd = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(qd)
 
-# ---- Safe defaults from query_data.py ----
+# --- Defaults from query_data (with safe fallbacks) ---
 DEFAULT_MODEL = getattr(qd, "DEFAULT_MODEL", "gpt-4o-mini")
 DEFAULT_K = getattr(qd, "DEFAULT_K", 4)
 DEFAULT_MIN_SCORE = getattr(qd, "DEFAULT_MIN_SCORE", 0.55)
@@ -29,11 +41,11 @@ DEFAULT_REPLY_LANG = getattr(qd, "DEFAULT_REPLY_LANG", "auto")
 DEFAULT_CHROMA_PATH = getattr(qd, "DEFAULT_CHROMA_PATH", "chroma")
 DEFAULT_COLLECTION = getattr(qd, "DEFAULT_COLLECTION", "siit-faqs")
 
-# ---- Helpers ----
+# --- Helpers ---
 def read_secret(name: str) -> str | None:
-    """Safely read a Streamlit secret without crashing if secrets.toml is missing."""
+    """Safely read a Streamlit secret without raising when secrets.toml is missing."""
     try:
-        return st.secrets[name]  # raises if no secrets file or key
+        return st.secrets[name]  # type: ignore[attr-defined]
     except Exception:
         return None
 
@@ -46,20 +58,20 @@ def resolve_openai_key() -> str | None:
     """
     key = read_secret("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or st.session_state.get("OPENAI_API_KEY")
     if key:
-        os.environ["OPENAI_API_KEY"] = key  # make visible to langchain_openai
+        os.environ["OPENAI_API_KEY"] = key  # surface to langchain_openai
     return key
 
 def ensure_dir(path_str: str) -> None:
     Path(path_str).mkdir(parents=True, exist_ok=True)
 
-# ---- UI ----
+# --- UI ---
 st.set_page_config(page_title="SIIT RAG Assistant", page_icon="🎓", layout="wide")
 st.title("🎓 SIIT Academic Support (RAG)")
 
 with st.sidebar:
     st.header("🔑 OpenAI API Key")
 
-    # Show current key source without triggering StreamlitSecretNotFoundError
+    # Non-crashing key source indicator
     if read_secret("OPENAI_API_KEY"):
         key_source = "Streamlit Secrets"
     elif os.getenv("OPENAI_API_KEY"):
@@ -89,7 +101,9 @@ with st.sidebar:
     chroma_path = st.text_input("Chroma path", value=DEFAULT_CHROMA_PATH)
     collection = st.text_input("Collection name", value=DEFAULT_COLLECTION)
 
-# Main input
+    st.divider()
+    show_debug = st.checkbox("Show retrieval debug panel", value=False)
+
 question = st.text_area(
     "Ask your question",
     height=120,
@@ -114,7 +128,7 @@ if demo:
     question = "How do I request a SIIT Transcript/Certificate document?"
     st.info("Using sample question.")
 
-# ---- Ask flow ----
+# --- Handle ask/demo ---
 if ask or demo:
     if not question.strip():
         st.warning("Please enter a question.")
@@ -123,8 +137,52 @@ if ask or demo:
         if not key:
             st.error("No OpenAI API key found. Paste one in the sidebar or configure Streamlit secrets.")
         else:
-            ensure_dir(chroma_path)  # make sure persistence dir exists
+            ensure_dir(chroma_path)
 
+            # Optional retrieval debug panel (does not affect final answer)
+            if show_debug:
+                try:
+                    db_dbg = qd.get_db(chroma_path, collection)
+                    retriever_dbg = qd.build_retriever(db_dbg, use_bm25=use_bm25, k=k)
+                    expanded_q = qd.expand_query(question.strip())
+
+                    docs_dbg = []
+                    scores_dbg = None
+
+                    # If it's the ensemble path, there are no numeric scores
+                    try:
+                        from langchain.retrievers import EnsembleRetriever  # type: ignore
+                        is_ensemble = isinstance(retriever_dbg, EnsembleRetriever)
+                    except Exception:
+                        is_ensemble = False
+
+                    if is_ensemble:
+                        docs_dbg = retriever_dbg.invoke(expanded_q)
+                    else:
+                        results_dbg = qd.similarity_search_with_scores(db_dbg, expanded_q, k=k)
+                        docs_dbg = [doc for doc, _s in results_dbg]
+                        scores_dbg = [float(_s) for _d, _s in results_dbg]
+
+                    with st.expander("🔎 Debug: retrieved documents & query", expanded=False):
+                        st.write("**Expanded query used for retrieval:**", expanded_q)
+                        if not docs_dbg:
+                            st.info("No documents were retrieved.")
+                        else:
+                            for i, doc in enumerate(docs_dbg, start=1):
+                                md = (doc.metadata or {})
+                                title = md.get("title", "")
+                                section = md.get("section", "")
+                                source = md.get("source", "")
+                                score = f"{scores_dbg[i-1]:.3f}" if scores_dbg and i-1 < len(scores_dbg) else "—"
+                                st.markdown(f"**{i}. {title} › {section}** ({source}) — score: {score}")
+                                excerpt = (doc.page_content or "").strip().replace("\n", " ")
+                                if len(excerpt) > 600:
+                                    excerpt = excerpt[:600] + " ..."
+                                st.code(excerpt, language="markdown")
+                except Exception as e:
+                    st.caption(f"Debug panel error (safe to ignore): {e}")
+
+            # Capture printed Markdown from qd.run_query(...)
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf):

@@ -9,3 +9,4 @@ python-dotenv>=1.0.1
 langchain-chroma
 rank_bm25
 streamlit
+pysqlite3-binary>=0.5.0
